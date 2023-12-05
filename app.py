@@ -25,6 +25,14 @@ category_images_data = []
 seuil = 0.2
 
 
+def normalize_histogram(histogram):
+    total = sum(histogram)
+    if total == 0:
+        return histogram  # Avoid division by zero
+    return [float(bin_count) / total for bin_count in histogram]
+
+
+
 def extract_tamura_features(image):
     gray_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
@@ -180,42 +188,66 @@ def get_channel_distances(descriptor1, descriptor2, channel):
         else:
             return descriptor
 
+
+    def normalize_distance(distance, dimensions):
+        return distance / np.sqrt(dimensions)
+
     value1 = get_value(descriptor1, channel)
     value2 = get_value(descriptor2, channel)
 
     # Handle case when values are strings
-    if isinstance(value1, str) or isinstance(value2, str):
-        return 0.0 if value1 == value2 else 1.0  # Assign a distance of 0 for identical strings, 1 otherwise
+    if isinstance(value1, list) and all(isinstance(x, (int, float, np.integer, np.floating)) for x in value1):
+        value1 = normalize_feature(value1)
+        value2 = normalize_feature(value2)
 
-    return euclidean(normalize_feature(value1), normalize_feature(value2))
+    # Handle case when values are strings
+    if isinstance(value1, str) or isinstance(value2, str):
+        return 0.0 if value1 == value2 else 1.0
+
+    # Calculate and normalize Euclidean distance
+    raw_distance = euclidean(value1, value2)
+    normalized_distance = normalize_distance(raw_distance, len(value1))
+
+    return normalized_distance
 
 
 def calculate_descriptor_distance(descriptor1, descriptor2, descriptor_type):
     if not descriptor1 and not descriptor2:
-        return 0.0  # Return 0 for identical descriptors if both are empty
+        return 0.0
     elif not descriptor1 or not descriptor2:
-        return np.inf  # Return a large value for infinite distance if either descriptor is empty
+        return 1.0
 
-    if descriptor_type == "histogram_colors" or descriptor_type == "color_moments":
-        channels = ['red', 'green', 'blue']
-        distances = [get_channel_distances(descriptor1, descriptor2, channel) for channel in channels]
-        distance = np.mean(distances)
-    elif descriptor_type == "dominant_colors":
-        channels = ['color0', 'color1', 'color2', 'color3', 'color4']
-        distances = [get_channel_distances(descriptor1, descriptor2, channel) for channel in channels]
-        distance = np.mean(distances)
-    elif descriptor_type == "tamura_features" or descriptor_type == "gabor_descriptors":
-        distance = euclidean(normalize_feature(descriptor1), normalize_feature(descriptor2))
-    else:
-        raise ValueError(f"Unsupported descriptor type: {descriptor_type}")
+    def get_channels(descriptor, descriptor_type):
+        if isinstance(descriptor, dict):
+            # For dictionary-type descriptors, use keys as channels
+            return descriptor.keys()
+        elif isinstance(descriptor, list):
+            # For list-type descriptors, use index positions as channels
+            return range(len(descriptor))
+        else:
+            raise ValueError(f"Unsupported data structure for descriptor type: {descriptor_type}")
 
-    return distance
+    channels1 = get_channels(descriptor1, descriptor_type)
+    channels2 = get_channels(descriptor2, descriptor_type)
+
+    if len(channels1) != len(channels2):
+        raise ValueError("Descriptors do not have the same number of channels")
+
+    distances = [get_channel_distances(descriptor1, descriptor2, channel) for channel in channels1]
+
+    return np.mean(distances)
+
+
+# The get_channel_distances function should be able to handle both dictionary and list inputs.
 
 
 def calculate_feature_similarity(selected_feature, other_feature, descriptor_type):
     # Using 1 - distance as the similarity measure
     distance = calculate_descriptor_distance(selected_feature, other_feature, descriptor_type)
     similarity = 1 - distance
+
+
+    print(similarity)
 
     return similarity
 
@@ -260,7 +292,6 @@ def calculate_similarity_route():
     else:
         print("Seuil is not provided in the request")
 
-    print(seuil)
 
     # Calculate similarity
     similar_images = calculate_similarity(selected_image_data, category_images_data, seuil,weights)
@@ -274,15 +305,15 @@ def calculate_similarity_route():
     return jsonify(result)
 
 
-def calculate_value_association(similarity_values, user_feedback):
-    is_good_feedback = user_feedback[0]["relevance"].lower() == "bon" if user_feedback else True
-
+def calculate_value_association(similarity_values, user_feedback,i):
+    is_good_feedback = user_feedback[i]["relevance"].lower() == "bon" if user_feedback else True
     sorted_indices = np.argsort(similarity_values)
 
     if is_good_feedback:
         value_association = {index: 1.2 - rank * 0.1 for rank, index in enumerate(sorted_indices)}
     else:
-        value_association = {index: 0.8 + rank * 0.1 for rank, index in enumerate(sorted_indices)}
+        value_association = {index: 1 for rank, index in enumerate(sorted_indices)}
+
 
     return value_association
 
@@ -315,6 +346,8 @@ def update_weights(old_weights, similarity_matrix, user_feedback):
 def calculate_similarity_matrix(selected_image_data, category_images_data, user_feedback):
     similarity_matrix = []
 
+    i=0;
+
     for other_image_data in category_images_data:
         feature_similarities = {}
 
@@ -327,10 +360,12 @@ def calculate_similarity_matrix(selected_image_data, category_images_data, user_
                                                                   descriptor_type)
                 feature_similarities[descriptor_type] = feature_similarity
 
-        weight_association = calculate_value_association(list(feature_similarities.values()), user_feedback)
+        weight_association = calculate_value_association(list(feature_similarities.values()), user_feedback,i)
+        i=i+1
         normalized_weights = {key: weight_association[index] for index, key in enumerate(feature_similarities)}
 
         similarity_matrix.append(normalized_weights)
+
 
     return similarity_matrix
 
@@ -360,11 +395,24 @@ def calculate_similarity_with_updated_weights(selected_image_data, category_imag
 
 @app.route('/api/update_weights_and_similarity', methods=['POST'])
 def update_weights_and_similarity():
+
+
     data = request.get_json()
 
     selected_image_data = data.get('selected_image_data', {})
     category_images_data = data.get('category_images_data', [])
     user_feedback = data.get('user_feedback', [])
+
+    print(selected_image_data)
+
+    # Assuming the histogram is stored in a key 'histogram' in the data
+    if 'histogram' in selected_image_data:
+        selected_image_data['histogram'] = normalize_histogram(selected_image_data['histogram'])
+
+    for image_data in category_images_data:
+        if 'histogram' in image_data:
+            image_data['histogram'] = normalize_histogram(image_data['histogram'])
+
 
 
     # Calculate similarity matrix
